@@ -12,7 +12,7 @@
 //! - [`spawn`]: spawn the driver subprocess, wait for its UDS to be ready,
 //!   and return a live gRPC channel plus a [`ManagedDriverProcess`] handle
 //!   that will reap the subprocess and clean up the socket on drop.
-//! - Helpers to resolve the driver binary, compute the socket path, and
+//! - Helpers to resolve the driver binary, allocate the socket directory, and
 //!   validate guest TLS material when the gateway runs an `https://` control
 //!   plane.
 //!
@@ -39,7 +39,7 @@ use openshell_server::AcquiredRemoteDriverEndpoint;
 use openshell_server::ManagedDriverProcess;
 use openshell_server::config_file::OtlpConfig;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -56,8 +56,15 @@ use tonic::transport::Endpoint;
 use tower::service_fn;
 
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
-const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
+#[cfg(unix)]
+const COMPUTE_DRIVER_SOCKET_ROOT: &str = "/tmp";
+#[cfg(unix)]
+const COMPUTE_DRIVER_SOCKET_DIR_ALLOC_RETRIES: usize = 16;
+#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
+/// Usable `AF_UNIX` `sun_path` bytes on macOS, the tighter of the supported hosts.
+#[cfg(unix)]
+const MAX_SUN_PATH_LEN: usize = 103;
 
 /// Configuration for launching and talking to the VM compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -344,29 +351,102 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-/// Path of the Unix domain socket the driver will listen on.
-pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
-    vm_config
-        .state_dir
-        .join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
-        .join(COMPUTE_DRIVER_SOCKET_NAME)
+/// Owner-only directory holding the driver's Unix domain socket.
+///
+/// Removes the socket and the directory on drop until ownership is handed to
+/// [`ManagedDriverProcess`] with [`ComputeDriverSocketDir::release`].
+#[cfg(unix)]
+#[derive(Debug)]
+struct ComputeDriverSocketDir {
+    dir: PathBuf,
+    armed: bool,
 }
 
 #[cfg(unix)]
-fn prepare_compute_driver_socket_path(
-    vm_config: &VmComputeConfig,
-    socket_path: &Path,
-) -> Result<()> {
-    let expected_uid = current_euid();
-    prepare_vm_state_dir(&vm_config.state_dir, expected_uid)?;
-    let parent = socket_path.parent().ok_or_else(|| {
-        Error::execution(format!(
-            "vm compute driver socket path '{}' has no parent directory",
+impl ComputeDriverSocketDir {
+    fn socket_path(&self) -> PathBuf {
+        self.dir.join(COMPUTE_DRIVER_SOCKET_NAME)
+    }
+
+    fn release(mut self) -> PathBuf {
+        self.armed = false;
+        self.dir.clone()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ComputeDriverSocketDir {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.socket_path());
+            let _ = std::fs::remove_dir(&self.dir);
+        }
+    }
+}
+
+/// Allocate a private directory for the driver's Unix domain socket.
+///
+/// The socket lives outside `state_dir` so its path fits the `AF_UNIX`
+/// `sun_path` limit no matter how deep `state_dir` is. `/tmp` is used directly
+/// because the macOS per-user `TMPDIR` is long enough to re-exceed the limit.
+/// The name is unpredictable and an existing entry is never reused, so another
+/// local user cannot pre-create or squat on the directory.
+#[cfg(unix)]
+fn allocate_compute_driver_socket_dir() -> Result<ComputeDriverSocketDir> {
+    let uid = current_euid();
+    allocate_compute_driver_socket_dir_with(Path::new(COMPUTE_DRIVER_SOCKET_ROOT), || {
+        let random =
+            u128::from_ne_bytes(openshell_crypto::random_bytes::<16>().map_err(|err| {
+                Error::execution(format!(
+                    "failed to generate vm compute driver socket dir name: {err}"
+                ))
+            })?);
+        Ok(format!("os-{uid}-{random:032x}"))
+    })
+}
+
+#[cfg(unix)]
+fn allocate_compute_driver_socket_dir_with(
+    base: &Path,
+    mut gen_name: impl FnMut() -> Result<String>,
+) -> Result<ComputeDriverSocketDir> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    for _ in 0..COMPUTE_DRIVER_SOCKET_DIR_ALLOC_RETRIES {
+        let dir = base.join(gen_name()?);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {
+                let socket_dir = ComputeDriverSocketDir { dir, armed: true };
+                check_socket_path_len(&socket_dir.socket_path())?;
+                return Ok(socket_dir);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(Error::execution(format!(
+                    "failed to create vm compute driver socket dir '{}': {err}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Err(Error::execution(format!(
+        "failed to allocate vm compute driver socket dir under '{}' after \
+         {COMPUTE_DRIVER_SOCKET_DIR_ALLOC_RETRIES} attempts",
+        base.display()
+    )))
+}
+
+#[cfg(unix)]
+fn check_socket_path_len(socket_path: &Path) -> Result<()> {
+    let len = socket_path.as_os_str().len();
+    if len > MAX_SUN_PATH_LEN {
+        return Err(Error::execution(format!(
+            "vm compute driver socket path '{}' is {len} bytes, over the \
+             {MAX_SUN_PATH_LEN}-byte Unix socket path limit",
             socket_path.display()
-        ))
-    })?;
-    prepare_private_socket_dir(parent, expected_uid)?;
-    remove_stale_socket(socket_path, expected_uid)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -395,23 +475,6 @@ fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn prepare_private_socket_dir(socket_dir: &Path, expected_uid: u32) -> Result<()> {
-    std::fs::create_dir_all(socket_dir).map_err(|err| {
-        Error::execution(format!(
-            "failed to create vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })?;
-    let _ = checked_directory_metadata(socket_dir, expected_uid, "vm compute driver socket dir")?;
-    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
-        Error::execution(format!(
-            "failed to restrict vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })
 }
 
 #[cfg(unix)]
@@ -448,47 +511,6 @@ fn checked_directory_metadata(
         )));
     }
     Ok(metadata)
-}
-
-#[cfg(unix)]
-fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(Error::execution(format!(
-                "failed to stat vm compute driver socket '{}': {err}",
-                socket_path.display()
-            )));
-        }
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is a symlink; refusing to remove it",
-            socket_path.display()
-        )));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is owned by uid {} but current euid is {}",
-            socket_path.display(),
-            metadata.uid(),
-            expected_uid
-        )));
-    }
-    if !file_type.is_socket() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket path '{}' exists but is not a Unix socket",
-            socket_path.display()
-        )));
-    }
-    std::fs::remove_file(socket_path).map_err(|err| {
-        Error::execution(format!(
-            "failed to remove stale vm compute driver socket '{}': {err}",
-            socket_path.display()
-        ))
-    })
 }
 
 #[cfg(unix)]
@@ -535,9 +557,10 @@ pub async fn spawn(
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
-    let socket_path = compute_driver_socket_path(vm_config);
     let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
-    prepare_compute_driver_socket_path(vm_config, &socket_path)?;
+    prepare_vm_state_dir(&vm_config.state_dir, current_euid())?;
+    let socket_dir = allocate_compute_driver_socket_dir()?;
+    let socket_path = socket_dir.socket_path();
 
     let mut command = Command::new(&driver_bin);
     command.kill_on_drop(true);
@@ -593,7 +616,9 @@ pub async fn spawn(
         ))
     })?;
     let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
-    let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
+    let process = Arc::new(
+        ManagedDriverProcess::new(child, socket_path).with_socket_dir(socket_dir.release()),
+    );
     Ok(AcquiredRemoteDriverEndpoint::managed(
         "vm", channel, process,
     ))
@@ -801,18 +826,18 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, append_vm_identity_args, append_vm_network_trust_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        validate_vm_sandbox_identity,
+        COMPUTE_DRIVER_SOCKET_NAME, COMPUTE_DRIVER_SOCKET_ROOT, MAX_SUN_PATH_LEN, VmComputeConfig,
+        allocate_compute_driver_socket_dir, allocate_compute_driver_socket_dir_with,
+        append_otlp_args, append_vm_identity_args, append_vm_network_trust_args,
+        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, check_socket_path_len,
+        compute_driver_guest_tls_paths, current_euid, prepare_vm_state_dir,
+        resolve_compute_driver_bin, resolve_driver_search_dirs, validate_vm_sandbox_identity,
     };
     use openshell_core::{NetworkSupervisorTrustBundle, UpstreamProxyConfig};
     use openshell_server::config_file::{
         OcsfOtlpConfig, OcsfSchemaVersion, OtlpConfig, OtlpTracesConfig,
     };
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -1260,112 +1285,142 @@ mod tests {
     }
 
     #[test]
-    fn compute_driver_socket_path_uses_private_run_dir() {
-        let state_dir = PathBuf::from("/tmp/openshell-vm-state");
-        let vm_config = VmComputeConfig {
-            state_dir: state_dir.clone(),
-            ..Default::default()
-        };
+    fn compute_driver_socket_dir_is_private_and_short() {
+        let socket_dir = allocate_compute_driver_socket_dir().unwrap();
+        let dir = socket_dir.dir.clone();
+        let socket_path = socket_dir.socket_path();
 
-        assert_eq!(
-            compute_driver_socket_path(&vm_config),
-            state_dir.join("run").join("compute-driver.sock")
+        assert!(dir.starts_with("/tmp"));
+        assert_eq!(socket_path, dir.join("compute-driver.sock"));
+        let metadata = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), current_euid());
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+
+        drop(socket_dir);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn compute_driver_socket_path_fits_macos_sun_path() {
+        // Worst case: 10-digit UID and 32 hex characters of randomness.
+        let worst_case = PathBuf::from(COMPUTE_DRIVER_SOCKET_ROOT)
+            .join(format!("os-{}-{}", u32::MAX, "f".repeat(32)))
+            .join(COMPUTE_DRIVER_SOCKET_NAME);
+
+        assert!(worst_case.as_os_str().len() <= MAX_SUN_PATH_LEN);
+        check_socket_path_len(&worst_case).unwrap();
+    }
+
+    #[test]
+    fn compute_driver_socket_dir_allocations_are_distinct() {
+        let first = allocate_compute_driver_socket_dir().unwrap();
+        let second = allocate_compute_driver_socket_dir().unwrap();
+
+        assert_ne!(first.dir, second.dir);
+    }
+
+    #[test]
+    fn compute_driver_socket_dir_skips_existing_entries_without_touching_them() {
+        let base = tempdir().unwrap();
+        let squatted_dir = base.path().join("taken-1");
+        let squatted_link = base.path().join("taken-2");
+        let link_target = base.path().join("link-target");
+        std::fs::create_dir(&squatted_dir).unwrap();
+        std::fs::set_permissions(&squatted_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::create_dir(&link_target).unwrap();
+        std::os::unix::fs::symlink(&link_target, &squatted_link).unwrap();
+        let mut attempt = 0;
+
+        let socket_dir = allocate_compute_driver_socket_dir_with(base.path(), || {
+            attempt += 1;
+            Ok(format!("taken-{attempt}"))
+        })
+        .unwrap();
+
+        assert_eq!(socket_dir.dir, base.path().join("taken-3"));
+        let squatted_mode = std::fs::metadata(&squatted_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(squatted_mode & 0o777, 0o777);
+        assert!(
+            std::fs::symlink_metadata(&squatted_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
+        assert!(link_target.read_dir().unwrap().next().is_none());
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_creates_private_run_dir() {
+    fn compute_driver_socket_dir_fails_after_retries() {
+        let base = tempdir().unwrap();
+        std::fs::create_dir(base.path().join("taken")).unwrap();
+
+        let err = allocate_compute_driver_socket_dir_with(base.path(), || Ok("taken".to_string()))
+            .expect_err("occupied names should exhaust retries")
+            .to_string();
+        assert!(err.contains("after 16 attempts"));
+    }
+
+    #[test]
+    fn compute_driver_socket_dir_rejects_path_over_sun_path_limit() {
+        let base = tempdir().unwrap();
+        let long_name = "d".repeat(MAX_SUN_PATH_LEN);
+
+        let err = allocate_compute_driver_socket_dir_with(base.path(), || Ok(long_name.clone()))
+            .expect_err("socket path over the limit should be rejected")
+            .to_string();
+        assert!(err.contains("bytes, over the 103-byte Unix socket path limit"));
+        assert!(err.contains("compute-driver.sock"));
+        assert!(!base.path().join(&long_name).exists());
+    }
+
+    #[test]
+    fn compute_driver_socket_dir_release_keeps_dir() {
+        let socket_dir = allocate_compute_driver_socket_dir().unwrap();
+
+        let dir = socket_dir.release();
+
+        assert!(dir.is_dir());
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn prepare_vm_state_dir_creates_private_dir() {
         let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
+        let state_dir = dir.path().join("state");
 
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+        prepare_vm_state_dir(&state_dir, current_euid()).unwrap();
 
-        let mode = std::fs::metadata(vm_config.state_dir.join("run"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(state_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_restricts_existing_run_dir() {
+    fn prepare_vm_state_dir_restricts_existing_dir() {
         let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let run_dir = vm_config.state_dir.join("run");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+        prepare_vm_state_dir(&state_dir, current_euid()).unwrap();
 
-        let mode = std::fs::metadata(run_dir).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(state_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
-        std::fs::set_permissions(&vm_config.state_dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        let mode = std::fs::metadata(vm_config.state_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_state_dir() {
+    fn prepare_vm_state_dir_rejects_symlinked_dir() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
         let state_link = dir.path().join("state-link");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &state_link).unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: state_link,
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
 
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+        let err = prepare_vm_state_dir(&state_link, current_euid())
             .expect_err("symlinked state dir should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_run_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let target = dir.path().join("run-target");
-        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, vm_config.state_dir.join("run")).unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked run dir should be rejected")
             .to_string();
         assert!(err.contains("is a symlink"));
     }
@@ -1385,56 +1440,5 @@ mod tests {
             .expect_err("wrong owner should be rejected")
             .to_string();
         assert!(err.contains("is owned by uid"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_socket() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink("/tmp/not-a-socket", &socket_path).unwrap();
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked socket should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_non_socket_stale_path() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::fs::write(&socket_path, "not a socket").unwrap();
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("regular file should be rejected")
-            .to_string();
-        assert!(err.contains("is not a Unix socket"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_removes_same_owner_stale_socket() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        let listener = StdUnixListener::bind(&socket_path).unwrap();
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        drop(listener);
-        assert!(!socket_path.exists());
     }
 }
